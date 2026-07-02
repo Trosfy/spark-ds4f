@@ -15885,7 +15885,15 @@ static int routed_moe_launch(
      * wider shape, mmq declined -- reject and let the caller fall back.
      * Note n_total_expert (runtime, was constant 256 before PRO support)
      * sizes the model weight stride. */
-    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
+    /* spark-ds4f: the upstream decode-perf fork declined Q4_K prefill (n_tokens>1)
+     * here, leaving its own mmq Q4_K routed-MoE kernels (ds4_mmq_q4_K_moe_pair/_moe
+     * below) as unreachable dead code -> q2-q4 imatrix GGUFs failed prefill with
+     * "cuda prefill failed". Those kernels work on GB10/sm_121 (validated: q2-q4
+     * "capital of France"->Paris, ~14 t/s decode); the guard was just never lifted.
+     * Let Q4_K prefill fall through to the mmq path. If a kernel returns nonzero the
+     * mmq_moe_fallback re-applies this decline for non-decode q4k shapes, so the
+     * worst case is a graceful "not handled", never a crash. */
+    /* if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0; */
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
