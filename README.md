@@ -1,3 +1,34 @@
+# spark-ds4f — DwarfStar (ds4) for DGX Spark / GB10, with q2-q4 Q4_K prefill
+
+> **This is a fork.** Upstream engine: [`antirez/ds4`](https://github.com/antirez/ds4)
+> (DwarfStar, MIT). Base branch: [`Entrpi/ds4` `decode-perf-tuning`](https://github.com/Entrpi/ds4/tree/decode-perf-tuning)
+> (the fast **mmq** CUDA decode path). This fork adds **one** change on top.
+>
+> **What's changed:** `Entrpi/ds4`'s `decode-perf-tuning` rewrote the routed-MoE
+> matmuls around vendored llama.cpp **mmq** kernels and, in `routed_moe_launch`
+> (`ds4_cuda.cu`), guarded **Q4_K prefill** (`n_tokens > 1`) off — leaving its own
+> `ds4_mmq_q4_K_moe_pair`/`_moe` kernels as unreachable dead code. As a result,
+> **q2-q4 imatrix GGUFs** (`…Layers37-42Q4KExperts…`, the *preferred* 128 GB
+> DeepSeek-V4-Flash quant) failed prefill on CUDA with `cuda prefill failed`,
+> while pure q2/IQ2_XXS worked. Those mmq Q4_K kernels in fact run correctly on
+> **GB10 / sm_121** — the guard was simply never lifted. This fork drops the guard
+> so Q4_K prefill reaches the mmq path; `mmq_moe_fallback` still declines
+> non-decode Q4_K shapes on a nonzero return, so the worst case is a graceful
+> "not handled", never a crash. Result: **fast mmq decode *and* q2-q4 compatibility**
+> on the DGX Spark.
+>
+> **Validated on:** NVIDIA DGX Spark (GB10, sm_121, CUDA 13.0), q2-q4 imatrix GGUF
+> — `"capital of France" → Paris`, ~14 t/s decode.
+>
+> **Build (GB10):** `make cuda CUDA_ARCH=sm_121` (the `cuda-spark` target's empty
+> `-arch` defaults to sm_75 on CUDA 13 — pass the arch explicitly).
+> **Serve:** `./ds4-server --cuda -m <q2-q4-imatrix.gguf> -c 16384 --port 8000`.
+>
+> See the single functional commit for the exact diff. Everything below is the
+> upstream DwarfStar README.
+
+---
+
 # DwarfStar
 
 **DwarfStar** is a small native inference engine optimized first for
