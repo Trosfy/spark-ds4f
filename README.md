@@ -1,3 +1,28 @@
+# spark-ds4f — Entrpi/DwarfStar (ds4) for DGX Spark / GB10
+
+> **This is a fork** of [`Entrpi/ds4`](https://github.com/Entrpi/ds4) (itself a fork of
+> [`antirez/ds4`](https://github.com/antirez/ds4), DwarfStar, MIT), tracking tag **`v0.6.3`**.
+> It currently carries **no functional delta** — this note is the only local change.
+>
+> **History:** an earlier local patch dropped a `routed_moe_launch` guard that declined Q4_K
+> routed-MoE prefill, so the q2-q4 hybrid GGUF (`…Layers37-42Q4KExperts…`) could prefill. As of
+> `v0.6.3` that guard is gone upstream — `ds4_cuda.cu` dispatches gate/up and down quant types
+> independently — so the patch was dropped on the rebase.
+>
+> **Build on GB10: `make cuda-spark`, and do NOT pass `CUDA_ARCH`.** The target hardcodes
+> `sm_121` itself and expands it to `-gencode arch=compute_121a,code=sm_121a -DDS4_CUDA_HAVE_MXF4=1`;
+> `-arch=sm_121a` alone silently emits `.target sm_121` and ptxas rejects the MMA. A previous
+> revision of this note recommended `make cuda CUDA_ARCH=sm_121` as a workaround for the old
+> target's empty `-arch`; that is obsolete and produces a **generic build without the Spark fast
+> paths — roughly a third of the prefill speed and half the decode speed.**
+>
+> **Verify the build:** `cuobjdump --list-elf ds4-server | grep sm_121a` must hit, and the boot log
+> must NOT print the "this CUDA device is a GB10 … but the binary is a generic CUDA build" warning.
+>
+> Everything below is the upstream README.
+
+---
+
 # Entrpi/DwarfStar
 
 **Entrpi/DwarfStar** (`ds4`) is a small native inference engine for **DeepSeek
