@@ -2,7 +2,21 @@
 
 > **This is a fork** of [`Entrpi/ds4`](https://github.com/Entrpi/ds4) (itself a fork of
 > [`antirez/ds4`](https://github.com/antirez/ds4), DwarfStar, MIT), tracking tag **`v0.6.3`**.
-> It currently carries **no functional delta** — this note is the only local change.
+> **Local delta — read this before rebasing.** The fork carries ONE functional patch, an
+> observability extension, in `ds4.h` + `ds4_server.c` (+ its tests, and the `/metrics` entry in
+> the API list below):
+>
+> - `ds4_time_to_first_token_seconds` and `ds4_inter_token_latency_seconds`, Prometheus
+>   histograms fed from the per-request `req_timings` block the `timings` porcelain already
+>   reports, so the serial and continuous lanes land in one series.
+> - A correctness fix that rides with it: `timings.decode_ms` on the serial lane used to be
+>   sampled after `canonicalize_tool_checkpoint`, folding tool-checkpoint rebuild time into
+>   decode and understating `decode_tok_s` on tool-calling turns.
+>
+> It is deliberately shaped as a generic extension so it can be offered upstream; if it lands
+> there, drop it here. **Do not assume this fork is delta-free at rebase time** — that assumption
+> is exactly why the previous local patch was dropped (see History), and it would silently discard
+> this one.
 >
 > **History:** an earlier local patch dropped a `routed_moe_launch` guard that declined Q4_K
 > routed-MoE prefill, so the q2-q4 hybrid GGUF (`…Layers37-42Q4KExperts…`) could prefill. As of
@@ -19,7 +33,8 @@
 > **Verify the build:** `cuobjdump --list-elf ds4-server | grep sm_121a` must hit, and the boot log
 > must NOT print the "this CUDA device is a GB10 … but the binary is a generic CUDA build" warning.
 >
-> Everything below is the upstream README.
+> Everything below is the upstream README, except the `/metrics` entry in the API list, which
+> documents the local delta described above.
 
 ---
 
@@ -199,7 +214,57 @@ Supported endpoints:
   v0.6.0 also the memory families — allocation census by class and domain,
   the availability observation with both raw estimates behind it, governor
   decisions per consumer, reclaim outcomes, and typed request rejections
-  labelled by lane and reason)
+  labelled by lane and reason; plus two per-request latency histograms,
+  `ds4_time_to_first_token_seconds` (arrival to first generated token,
+  queue wait included) and `ds4_inter_token_latency_seconds` (mean gap
+  between generated tokens, one observation per request), both fed from the
+  same per-request timings the `timings` response block reports, so the
+  serial and continuous lanes land in one series. A request that generates
+  a single token contributes no inter-token observation. Prefix-cache hit
+  rate is not a separate series — it is
+  `ds4_tokens_prefilled_total{kind="cached"}` over the sum of both kinds)
+
+  The histogram bucket boundaries, in seconds, are a compatibility surface:
+  adding a rung is safe, moving one makes new scrapes incomparable with
+  everything already stored.
+
+  - `ds4_time_to_first_token_seconds`: `0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8,
+    15, 30, 60, 120, 300, +Inf`
+  - `ds4_inter_token_latency_seconds`: `0.01, 0.02, 0.03, 0.04, 0.05,
+    0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1, 2.5, +Inf`
+
+  These rungs are shared with llama.cpp's `llamacpp:time_to_first_token_seconds`
+  and `llamacpp:inter_token_latency_seconds`, and the `le` label strings are
+  byte-identical, so those two engines' buckets can be unioned directly.
+  **vLLM cannot join this union** — it ships its own ladder (finest rung 1 ms,
+  coarsest 2560 s) which shares only four rungs with this one, so summing it in
+  yields a series where a given `le` carries some engines' observations and not
+  others: not a cumulative histogram, and a quantile that is wrong rather than
+  absent. (Label *rendering* is not the issue — Prometheus normalizes `le` on
+  scrape, storing `1.0` for the `1` emitted here — so do not "fix" the rendering
+  and re-enable a cross-engine sum.)
+
+  ```promql
+  histogram_quantile(0.95, sum by (le) (rate(
+    {__name__=~"(ds4_|llamacpp:)time_to_first_token_seconds_bucket"}[5m])))
+  ```
+
+  The prefix-cache counters do **not** union the same way, and a `__name__`
+  matcher written by analogy with the above will silently return only one
+  engine. ds4 splits one counter by a `kind` label; llama.cpp uses two counter
+  names. The hit rate has to be written per engine:
+
+  ```promql
+  # ds4 -- sum without(kind) on BOTH sides. Without it the operands carry
+  # different label sets (one has kind="cached", one has had kind removed),
+  # Prometheus finds no matching pair, and the result is silently empty.
+  sum without(kind) (rate(ds4_tokens_prefilled_total{kind="cached"}[5m]))
+    / sum without(kind) (rate(ds4_tokens_prefilled_total[5m]))
+  # llama.cpp
+  rate(llamacpp:prompt_tokens_cache_total[5m])
+    / (rate(llamacpp:prompt_tokens_cache_total[5m])
+       + rate(llamacpp:prompt_tokens_total[5m]))
+  ```
 - `GET /v1/stats` (human-readable status board; JSON with
   `Accept: application/json` — `watch -n2 curl -s :8000/v1/stats` works)
 

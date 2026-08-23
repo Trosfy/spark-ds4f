@@ -909,6 +909,25 @@ typedef struct {
     uint64_t stamp;               /* monotonic second this bucket belongs to */
     uint64_t dec_tok, dec_steps, pf_tok;
 } ds4_metrics_bucket;
+/* Fixed-ladder latency histogram, Prometheus-shaped.  Stores PER-BUCKET
+ * counts; the cumulative `_bucket{le=...}` series is formed at render, so an
+ * observer touches exactly one rung and never walks the ladder under a lock.
+ * The total is nanoseconds (not a double) so `_sum` stays integer-exact under
+ * concurrent relaxed adds -- the same reason cont_ontoken_ns is ns.  The
+ * ladders themselves belong to the emitter: this struct only needs to know how
+ * many rungs it has, and every rung is always rendered (an absent bucket does
+ * not read as zero to a consumer, it makes histogram_quantile silently wrong). */
+#define DS4_METRICS_HIST_BUCKETS 14   /* 13 finite rungs + the +Inf overflow */
+/* An observation above this is not a latency, it is a broken clock.  Converting
+ * an out-of-range double to an unsigned integer is undefined behaviour, and
+ * sum_ns is a lifetime counter with no reset path, so one bad sample would
+ * poison the series for the life of the process.  24h. */
+#define DS4_METRICS_HIST_MAX_NS (86400ull * 1000000000ull)
+typedef struct {
+    uint64_t bucket[DS4_METRICS_HIST_BUCKETS];
+    uint64_t count;
+    uint64_t sum_ns;
+} ds4_metrics_hist;
 typedef struct {
     /* requests (server-incremented; one increment per generation request) */
     uint64_t requests_started;
@@ -1027,6 +1046,14 @@ typedef struct {
      * and /v1/stats each render a FRESH compute from their own capture
      * (a stored gauge would just be the idle tick's stale echo). */
     uint64_t mem_reconcile_flagged;    /* counter */
+    /* Per-request latency distributions.  Both are fed from the req_timings
+     * block the server already stamps for the `timings` porcelain, so the
+     * serial and continuous lanes land in ONE series and neither histogram
+     * adds work to a decode step.  Quantiles need the distribution, not the
+     * mean: the trailing-window gauges above (ds4_decode_tok_s) cannot answer
+     * "what did the slow 5% of requests see". */
+    ds4_metrics_hist ttft_seconds;     /* arrival -> first generated token */
+    ds4_metrics_hist itl_seconds;      /* mean inter-token gap of a request */
     ds4_metrics_bucket win[DS4_METRICS_WIN_BUCKETS];
 } ds4_metrics;
 ds4_metrics *ds4_metrics_get(void);
@@ -1038,6 +1065,28 @@ static inline void ds4_metric_set(uint64_t *c, uint64_t v) {
 }
 static inline uint64_t ds4_metric_read(const uint64_t *c) {
     return __atomic_load_n(c, __ATOMIC_RELAXED);
+}
+/* Observe one latency sample.  `le_ns` is the caller's ladder in NANOSECONDS:
+ * DS4_METRICS_HIST_BUCKETS-1 finite rungs, ascending; the last bucket is the
+ * +Inf overflow and catches everything above the top rung.  Prometheus's `le`
+ * is inclusive, hence `>` rather than `>=`.
+ *
+ * The compare is INTEGER on purpose.  This tree builds with -ffast-math, under
+ * which `-funsafe-math-optimizations` rewrites a `ns / 1e9` divide into a
+ * multiply by an inexact reciprocal; the resulting 1-ulp error makes
+ * `sec > le[i]` true for a sample sitting exactly ON a rung, so it lands one
+ * rung high and `le` stops being inclusive.  Measured 2026-08-23: 9 of 26 rungs
+ * misclassified with a double ladder, 0 with this one.  Integers also make the
+ * classification identical to the sibling llama.cpp implementation, which is
+ * what lets the two engines' bucket series be unioned. */
+static inline void ds4_metric_hist_observe(ds4_metrics_hist *h,
+                                           const uint64_t *le_ns, uint64_t ns) {
+    if (ns > DS4_METRICS_HIST_MAX_NS) return;
+    int i = 0;
+    while (i < DS4_METRICS_HIST_BUCKETS - 1 && ns > le_ns[i]) i++;
+    ds4_metric_add(&h->bucket[i], 1);
+    ds4_metric_add(&h->count, 1);
+    ds4_metric_add(&h->sum_ns, ns);
 }
 /* Record dec_tok/dec_steps/pf_tok into the current second's bucket. */
 void ds4_metrics_window_add(uint64_t dec_tok, uint64_t dec_steps, uint64_t pf_tok);

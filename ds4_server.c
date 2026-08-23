@@ -5353,6 +5353,114 @@ static void append_timings_json(buf *b, const request *r) {
     buf_putc(b, '}');
 }
 
+/* The timings block's SECOND consumer: the per-request latency histograms on
+ * /metrics.  Same input as append_timings_json above, so both serving lanes
+ * (serial stamp + continuous stamp) are covered by one call site each and no
+ * per-token work is added to the decode loop.
+ *
+ * Ladders are in NANOSECONDS (see ds4_metric_hist_observe for why not seconds)
+ * and are sized to THIS engine's measured envelope rather than copied from
+ * another server's defaults (measured 2026-08-23, deepseek-v4-flash on GB10):
+ * plain decode 21.4 tok/s = 46.7 ms/token, speculative bursts to ~30 tok/s =
+ * 33 ms, and per-stream cadence at concurrency 8 falls to ~5.7 tok/s = 175 ms
+ * -- so the ITL ladder is dense between 30 and 200 ms.  TTFT spans a warm-prefix
+ * hit at 0.31 s and a cold long-context prefill at ~1000 tok/s, which is minutes
+ * at a 262k window, so its ladder is coarse and long.  A rung is a compatibility
+ * surface: adding one is safe, moving one silently rewrites history in every
+ * stored series and makes old and new scrapes incomparable.
+ *
+ * CROSS-REPO CONTRACT: these rungs are byte-identical to llama.cpp's
+ * hist_le_ttft_us / hist_le_itl_us (tools/server/server-context.cpp), which is
+ * what lets `sum by (le)` union the two engines' buckets into one fleet
+ * percentile.  Each repo's tests pin its own ladder, so a ONE-SIDED edit fails
+ * there -- but a coherent edit (rung + that repo's test) passes on both sides
+ * and silently makes the union interpolate across mismatched boundaries.
+ * Change these only together, and re-check the consumer that depends on it:
+ * spark-stack/infra/observability/prometheus/rules/fleet.yml. */
+static const uint64_t hist_le_ttft_ns[DS4_METRICS_HIST_BUCKETS - 1] = {
+    50000000ull, 100000000ull, 250000000ull, 500000000ull, 1000000000ull,
+    2000000000ull, 4000000000ull, 8000000000ull, 15000000000ull,
+    30000000000ull, 60000000000ull, 120000000000ull, 300000000000ull
+};
+static const uint64_t hist_le_itl_ns[DS4_METRICS_HIST_BUCKETS - 1] = {
+    10000000ull, 20000000ull, 30000000ull, 40000000ull, 50000000ull,
+    75000000ull, 100000000ull, 150000000ull, 200000000ull, 300000000ull,
+    500000000ull, 1000000000ull, 2500000000ull
+};
+
+/* The serial lane's stamps, gathered so the arithmetic below can be exercised
+ * without running a generation.  That arithmetic is not obvious -- some stamps
+ * describe the whole REQUEST and some describe one decode_again PASS -- and
+ * getting the split wrong is silent: it produces a plausible number in the
+ * wrong bucket, on a lifetime counter with no reset path.  It has already
+ * regressed once (a retry reset the TTFT endpoint and reported arrival ->
+ * RETRY's first token), which is why it lives behind a testable seam now. */
+typedef struct {
+    double t_arrive;         /* request arrival, pre-parse                    */
+    double t_prefill_beg;    /* prefill start                                 */
+    double t_prefill_end;    /* FIRST pass's decode start (whole request)     */
+    double t_first_tok;      /* FIRST pass's first token (whole request)      */
+    double t_pass_first_tok; /* THIS pass's first token                       */
+    double t_decode_end;     /* THIS pass's decode end, before host parse     */
+    int    request_tokens;   /* tokens this REQUEST delivered, all passes     */
+    int    pass_tokens;      /* tokens THIS pass delivered                    */
+    int    decode_steps;     /* THIS pass's engine steps                      */
+    int    prompt_tokens;
+    int    cached;
+} serial_timing_stamps;
+
+/* Fill the timings block from those stamps.  Returns true when it stamped (the
+ * caller then publishes); false leaves the block invalid, which append_timings_json
+ * renders as an omitted `timings` object.  Pure: no globals, no clock. */
+static bool serial_timings_fill(req_timings *t, const serial_timing_stamps *st) {
+    if (st->request_tokens <= 0 || !(st->t_first_tok > 0.0)) return false;
+    t->valid = true;
+    /* ttft_ms and prefill_ms describe the REQUEST: they end on the first pass's
+     * stamps, because that is when the client saw its first token.  A retry's
+     * recovery prefill is not this request's prefill. */
+    t->ttft_ms    = st->t_arrive > 0.0 ? (st->t_first_tok - st->t_arrive) * 1e3 : 0.0;
+    t->prefill_ms = st->t_prefill_end > st->t_prefill_beg
+                  ? (st->t_prefill_end - st->t_prefill_beg) * 1e3 : 0.0;
+    /* decode_ms describes the PASS whose tokens decode_tokens counts, so it
+     * starts at the per-pass stamp.  Both bounds matter: the > check alone is
+     * satisfied by an UNSTAMPED t_pass_first_tok (0.0), which would make
+     * decode_ms the absolute monotonic clock -- milliseconds since boot. */
+    t->decode_ms  = (st->t_pass_first_tok > 0.0 && st->t_decode_end > st->t_pass_first_tok)
+                  ? (st->t_decode_end - st->t_pass_first_tok) * 1e3 : 0.0;
+    t->prefill_tokens = st->prompt_tokens > st->cached ? st->prompt_tokens - st->cached : 0;
+    t->prefill_cached = st->cached;
+    t->decode_tokens  = st->pass_tokens;
+    t->decode_steps   = st->decode_steps;
+    return true;
+}
+
+/* Observe one settled request.  Call AFTER the timings stamp; a request whose
+ * lane never stamped (engine failure, static batch path) is invisible here by
+ * construction, exactly as it is in the `timings` porcelain.
+ *
+ * ttft_ms is 0 when arrival was not stamped -- omit rather than observe a
+ * fabricated zero.  The ITL sample is the request's MEAN inter-token gap:
+ * decode_ms spans first token -> completion, which contains exactly
+ * (decode_tokens - 1) gaps, so a single-token completion has no gap to
+ * report.  That interval is the cadence the client actually saw, engine and
+ * host projection together -- it is NOT the host-side-only slice counted by
+ * ds4_cont_ontoken_ns_total, which is a fraction of a gap, not a gap. */
+static void metrics_observe_request_timings(const req_timings *t) {
+    if (!t || !t->valid) return;
+    ds4_metrics *m = ds4_metrics_get();
+    /* The upper guards are not paranoia about the clock: they keep a finite but
+     * absurd double out of a double->uint64 conversion, which is undefined
+     * behaviour, and out of a lifetime counter that has no reset path.
+     * ds4_metric_hist_observe drops anything past its own ceiling too. */
+    if (t->ttft_ms > 0.0 && t->ttft_ms < 1e9)
+        ds4_metric_hist_observe(&m->ttft_seconds, hist_le_ttft_ns,
+                                (uint64_t)(t->ttft_ms * 1e6));
+    if (t->decode_tokens > 1 && t->decode_ms > 0.0 && t->decode_ms < 1e9) {
+        const double gap_ns = t->decode_ms * 1e6 / (double)(t->decode_tokens - 1);
+        ds4_metric_hist_observe(&m->itl_seconds, hist_le_itl_ns, (uint64_t)gap_ns);
+    }
+}
+
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
                             int prompt_tokens, int completion_tokens) {
     if (!r->stream_include_usage) return true;
@@ -12537,11 +12645,53 @@ static void generate_job(server *s, job *j) {
     bool dsml_recovery_attempted = false;
     uint64_t rng = resolve_job_seed(s, j);
     /* v0.2.x observability: whole-request stamps (persist across the
-     * decode_again tool-recovery rerun; timings reflect the full request). */
+     * decode_again tool-recovery rerun; timings reflect the full request).
+     * t_first_tok is the client's first visible token and t_prefill_end the
+     * moment sampling began, so both answer a question about the REQUEST and
+     * must survive a retry.  Their per-pass twins are reset at the label. */
     double t_first_tok = 0.0;
+    double t_prefill_end = 0.0;
+    /* Tokens this REQUEST delivered, summed across decode_again passes.  acc is
+     * re-created per pass, so acc.completion alone cannot gate the timings
+     * block: a turn that streamed 40 tokens, took the tool-recovery retry and
+     * then stopped immediately would report acc.completion == 0 and drop its
+     * timings and both histogram samples -- losing precisely the slow,
+     * retry-laden requests the latency tail exists to show. */
+    int completion_prior_passes = 0;
+    /* Per-PASS twin of t_first_tok, reset at decode_again.  It exists because
+     * decode_ms is divided by acc.completion, which the retry re-counts from
+     * zero: a whole-request numerator over a single-pass denominator reports a
+     * cadence that was never observed.  TTFT must NOT use this -- the client
+     * saw its first token on the first pass, whatever happened afterwards. */
+    double t_pass_first_tok = 0.0;
+    /* Stamped after the decode loop and the DSML truncation repair, before the
+     * parse / tool-checkpoint work below.  Taking the decode end from the
+     * timings block's own now_sec() instead would fold that work into
+     * decode_ms: canonicalize_tool_checkpoint can retokenize the whole live
+     * context and, on a REBUILD_NEEDED verdict, run a synchronous session
+     * replay off disk -- it installs a keepalive precisely because it can run
+     * for seconds.  A tool-calling turn would then report a decode rate several
+     * times slower than the engine actually ran.  On the decode_again retry path
+     * this is re-stamped per pass and t_pass_first_tok is reset with it (see the
+     * label), so both ends of decode_ms describe the same pass as the token
+     * count it is divided by.  t_first_tok is NOT reset -- TTFT is a
+     * whole-request quantity and the client saw its first token on pass one. */
+    double t_decode_end = 0.0;
     int serial_decode_steps = 0;
 decode_again:
     ;
+    /* A retry starts a NEW measured pass.  The accumulator below is re-created
+     * here, so acc.completion counts only this pass -- and the timings block at
+     * the bottom reports acc.completion as decode_tokens.  Everything that forms
+     * the other half of a per-token quotient must therefore reset with it, or
+     * the numerator spans every pass while the denominator counts one: a
+     * tool-recovery turn (40 tokens, a 3 s DSML recovery, then 5 more tokens)
+     * would report a 1.2 s inter-token gap against a real ~46 ms cadence.
+     * Reset ONLY the per-pass quantities: t_first_tok and t_prefill_end are
+     * whole-request and resetting them would move TTFT to the last pass, which
+     * is not when the client saw its first token. */
+    t_pass_first_tok = 0.0;
+    serial_decode_steps = 0;
     /* Inc 7a: ALL per-token semantic state lives in the shared accumulator;
      * this loop is now the serial DRIVER -- sampling, engine eval, emission,
      * logging, and session bookkeeping around sem_accum_feed. */
@@ -12556,6 +12706,7 @@ decode_again:
     if (max_tokens > room) max_tokens = room;   /* helper never returns < 0 */
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    if (t_prefill_end == 0.0) t_prefill_end = decode_t0;   /* first pass only */
     double last_decode_log_t = decode_t0;
     double decode_keepalive = decode_t0;   /* v0.5.7 C3: stream heartbeat */
     int last_decode_log_completion = 0;
@@ -12637,6 +12788,7 @@ decode_again:
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             if (t_first_tok == 0.0) t_first_tok = now_sec();
+            if (t_pass_first_tok == 0.0) t_pass_first_tok = now_sec();
 
             trace_piece(s, trace_id, piece, piece_len);
             /* Inc 7a: the shared accumulator does append/thinking/DSML/stop/
@@ -12863,6 +13015,7 @@ decode_again:
                                 "tool-error continuation appended %d tokens",
                                 recovery_tokens);
                     buf_free(&repaired);
+                    completion_prior_passes += acc.completion;
                     sem_accum_free(&acc);
                     goto decode_again;
                 }
@@ -12876,6 +13029,8 @@ decode_again:
         }
         buf_free(&repaired);
     }
+
+    t_decode_end = now_sec();   /* decode is over; everything below is host work */
 
     if (acc.completion > last_decode_log_completion) {
         log_decode_progress(j->req.kind, prompt_tokens, acc.completion,
@@ -12952,6 +13107,7 @@ decode_again:
                     free(parsed_content);
                     free(parsed_reasoning);
                     tool_calls_free(&parsed_calls);
+                    completion_prior_passes += acc.completion;
                     sem_accum_free(&acc);
                     goto decode_again;
                 }
@@ -13103,16 +13259,22 @@ decode_again:
     /* v0.2.x observability: serial-path timings (per-request speculation
      * detail is engine-internal on this path, so the spec fields stay 0 and
      * append_timings_json omits them). */
-    if (acc.completion > 0 && t_first_tok > 0.0) {
-        req_timings *t = &j->req.timings;
-        t->valid = true;
-        t->ttft_ms = j->t_arrive > 0.0 ? (t_first_tok - j->t_arrive) * 1e3 : 0.0;
-        t->prefill_ms = (decode_t0 - t0) * 1e3;
-        t->decode_ms = (now_sec() - t_first_tok) * 1e3;
-        t->prefill_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
-        t->prefill_cached = cached;
-        t->decode_tokens = acc.completion;
-        t->decode_steps = serial_decode_steps;
+    {
+        const serial_timing_stamps st = {
+            .t_arrive      = j->t_arrive,
+            .t_prefill_beg = t0,
+            .t_prefill_end = t_prefill_end,
+            .t_first_tok   = t_first_tok,
+            .t_pass_first_tok = t_pass_first_tok,
+            .t_decode_end  = t_decode_end,
+            .request_tokens = completion_prior_passes + acc.completion,
+            .pass_tokens    = acc.completion,
+            .decode_steps   = serial_decode_steps,
+            .prompt_tokens  = prompt_tokens,
+            .cached         = cached,
+        };
+        if (serial_timings_fill(&j->req.timings, &st))
+            metrics_observe_request_timings(&j->req.timings);
     }
 
     {
@@ -16237,6 +16399,7 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
                 j->req.cache_write_tokens = w > p ? p : w;
                 j->req.cache_read_tokens  = p - j->req.cache_write_tokens;
             }
+            metrics_observe_request_timings(t);
         }
     }
     /* Inc 3c: wire honors the client's zero budget exactly like the serial
@@ -17361,6 +17524,44 @@ static void mem_reconcile_idle_tick(server *s, int final_line) {
                    (double)s->rec_tol_bytes / 1048576.0);
 }
 
+/* Render one histogram family in Prometheus text form.  The stored buckets are
+ * per-rung counts; `le` is CUMULATIVE by definition, so the running total is
+ * built here rather than paid for by every observer.  Every rung is emitted
+ * even at zero: an absent bucket does not read as zero to a consumer, it makes
+ * histogram_quantile silently wrong.  _sum is seconds, from the ns accumulator.
+ *
+ * This runs on an HTTP thread with NO lock (send_metrics deliberately takes
+ * none -- gen_mu can be held for minutes) while observers are adding under
+ * relaxed atomics, so a scrape can interleave with an observation.  The
+ * property that makes that safe is monotonicity, not agreement: `cum` is a
+ * running sum of non-negative loads taken in ascending rung order, so the
+ * emitted series is monotone no matter what changes underneath it, and
+ * histogram_quantile consumes the buckets alone.  The +Inf bucket and _count
+ * agree on every scrape because both are the SAME running sum -- see below. */
+static void metrics_emit_histogram(buf *b, const char *name,
+                                   const ds4_metrics_hist *h, const uint64_t *le_ns) {
+    buf_printf(b, "# TYPE %s histogram\n", name);
+    uint64_t cum = 0;
+    for (int i = 0; i < DS4_METRICS_HIST_BUCKETS - 1; i++) {
+        cum += ds4_metric_read(&h->bucket[i]);
+        /* The le label is the rung in seconds.  Rungs are chosen so this renders
+         * exactly (0.05, 0.075, 300) and stays byte-stable across scrapes. */
+        buf_printf(b, "%s_bucket{le=\"%g\"} %llu\n",
+                   name, (double)le_ns[i] / 1e9, (unsigned long long)cum);
+    }
+    cum += ds4_metric_read(&h->bucket[DS4_METRICS_HIST_BUCKETS - 1]);
+    /* _count is the SAME running sum as +Inf, not a separate load of h->count.
+     * Prometheus's exposition contract requires the two to be equal, and an
+     * independent load can disagree with the bucket walk by whatever landed in
+     * between.  Deriving it costs nothing and makes the equality structural. */
+    buf_printf(b, "%s_bucket{le=\"+Inf\"} %llu\n"
+                  "%s_sum %.6f\n"
+                  "%s_count %llu\n",
+               name, (unsigned long long)cum,
+               name, (double)ds4_metric_read(&h->sum_ns) / 1e9,
+               name, (unsigned long long)cum);
+}
+
 /* Prometheus text exposition (hand-rolled: it is just lines). */
 static void send_metrics(server *s, int fd) {
     ds4_metrics *m = ds4_metrics_get();
@@ -17542,6 +17743,16 @@ static void send_metrics(server *s, int fd) {
                    "# TYPE ds4_tok_per_step gauge\n"
                    "ds4_tok_per_step %.3f\n",
                dec_tok_s, pf_tok_s, tok_step);
+    /* Per-request latency distributions, beside the trailing-window rates
+     * above: those answer "how fast is the box right now", these answer "what
+     * did an individual request see", which is the only form a p95 can be
+     * taken from.  Both are stamped once per settled request from the same
+     * timings block the `timings` porcelain renders, so serial and continuous
+     * rows are in one series and no decode step pays for them. */
+    metrics_emit_histogram(&b, "ds4_time_to_first_token_seconds",
+                           &m->ttft_seconds, hist_le_ttft_ns);
+    metrics_emit_histogram(&b, "ds4_inter_token_latency_seconds",
+                           &m->itl_seconds, hist_le_itl_ns);
     buf_printf(&b, "# TYPE ds4_banks_live gauge\n"
                    "ds4_banks_live %llu\n"
                    "# TYPE ds4_banks_total gauge\n"
@@ -20707,6 +20918,206 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
+}
+
+/* The histogram render contract, pinned.  Prometheus does not reject a
+ * malformed histogram -- histogram_quantile just returns a plausible wrong
+ * number -- so every property that makes the exposition valid is asserted here
+ * rather than trusted.  The exact `le` label strings are part of the contract:
+ * the sibling llama.cpp seat emits the same rungs, and `sum by (le)` only
+ * unions them if the strings match character for character. */
+static void test_metrics_histogram_render(void) {
+    ds4_metrics_hist h = {0};
+    /* One sample exactly ON each rung: `le` is inclusive, so each must land in
+     * its own rung, not the one above.  This is the assertion that fails if the
+     * ladder or the compare ever goes back to floating point under -ffast-math. */
+    for (int i = 0; i < DS4_METRICS_HIST_BUCKETS - 1; i++)
+        ds4_metric_hist_observe(&h, hist_le_itl_ns, hist_le_itl_ns[i]);
+    /* One above the top rung -> +Inf, and one absurd sample -> dropped whole. */
+    ds4_metric_hist_observe(&h, hist_le_itl_ns,
+                            hist_le_itl_ns[DS4_METRICS_HIST_BUCKETS - 2] + 1);
+    ds4_metric_hist_observe(&h, hist_le_itl_ns, DS4_METRICS_HIST_MAX_NS + 1);
+
+    TEST_ASSERT(h.count == (uint64_t)DS4_METRICS_HIST_BUCKETS);
+    for (int i = 0; i < DS4_METRICS_HIST_BUCKETS; i++)
+        TEST_ASSERT(h.bucket[i] == 1);   /* exactly one per rung, +Inf included */
+
+    buf b = {0};
+    metrics_emit_histogram(&b, "ds4_test_hist", &h, hist_le_itl_ns);
+    char *out = buf_take(&b);
+
+    TEST_ASSERT(strstr(out, "# TYPE ds4_test_hist histogram\n") == out);
+    /* Every rung rendered, cumulative, with the exact label strings. */
+    static const char *const le_labels[DS4_METRICS_HIST_BUCKETS - 1] = {
+        "0.01", "0.02", "0.03", "0.04", "0.05", "0.075", "0.1",
+        "0.15", "0.2", "0.3", "0.5", "1", "2.5"
+    };
+    for (int i = 0; i < DS4_METRICS_HIST_BUCKETS - 1; i++) {
+        char line[128];
+        snprintf(line, sizeof(line), "ds4_test_hist_bucket{le=\"%s\"} %d\n",
+                 le_labels[i], i + 1);
+        TEST_ASSERT(strstr(out, line) != NULL);
+    }
+    /* +Inf equals _count, and _count equals the observations we admitted. */
+    TEST_ASSERT(strstr(out, "ds4_test_hist_bucket{le=\"+Inf\"} 14\n") != NULL);
+    TEST_ASSERT(strstr(out, "ds4_test_hist_count 14\n") != NULL);
+    /* _sum excludes the dropped sample: the ladder sum plus the one-ns overflow. */
+    {
+        uint64_t want_ns = hist_le_itl_ns[DS4_METRICS_HIST_BUCKETS - 2] + 1;
+        for (int i = 0; i < DS4_METRICS_HIST_BUCKETS - 1; i++) want_ns += hist_le_itl_ns[i];
+        char line[128];
+        snprintf(line, sizeof(line), "ds4_test_hist_sum %.6f\n", (double)want_ns / 1e9);
+        TEST_ASSERT(strstr(out, line) != NULL);
+    }
+
+    /* A never-observed family still renders every rung -- an absent bucket is
+     * not read as zero by a consumer, it makes histogram_quantile wrong.  The
+     * TTFT ladder's label strings are pinned here, as the ITL ladder's are
+     * above: both are half of the cross-engine union contract. */
+    {
+        ds4_metrics_hist empty = {0};
+        buf b2 = {0};
+        metrics_emit_histogram(&b2, "ds4_test_empty", &empty, hist_le_ttft_ns);
+        char *out2 = buf_take(&b2);
+        static const char *const ttft_labels[DS4_METRICS_HIST_BUCKETS - 1] = {
+            "0.05", "0.1", "0.25", "0.5", "1", "2", "4",
+            "8", "15", "30", "60", "120", "300"
+        };
+        int rungs = 0;
+        for (const char *p = out2; (p = strstr(p, "_bucket{le=")) != NULL; p++) rungs++;
+        TEST_ASSERT(rungs == DS4_METRICS_HIST_BUCKETS);
+        for (int i = 0; i < DS4_METRICS_HIST_BUCKETS - 1; i++) {
+            char line[128];
+            snprintf(line, sizeof(line), "ds4_test_empty_bucket{le=\"%s\"} 0\n", ttft_labels[i]);
+            TEST_ASSERT(strstr(out2, line) != NULL);
+        }
+        TEST_ASSERT(strstr(out2, "ds4_test_empty_count 0\n") != NULL);
+        TEST_ASSERT(strstr(out2, "ds4_test_empty_bucket{le=\"+Inf\"} 0\n") != NULL);
+        free(out2);
+    }
+
+    free(out);
+}
+
+/* The OBSERVER seam: req_timings (milliseconds, doubles) -> histogram rungs
+ * (nanoseconds, integers).  The renderer test above cannot catch a fault here,
+ * and every fault here is silent -- a 1e3/1e6 transposition or a
+ * decode_tokens-vs-decode_tokens-1 denominator ships green and produces a
+ * plausible wrong p95 rather than a crash.  Both samples below sit EXACTLY on a
+ * rung, so they also re-assert inclusive-le through the real call path. */
+static void test_metrics_observe_request_timings(void) {
+    ds4_metrics *m = ds4_metrics_get();
+    const ds4_metrics_hist ttft0 = m->ttft_seconds;
+    const ds4_metrics_hist itl0  = m->itl_seconds;
+
+    req_timings t = {0};
+    t.valid = true;
+    t.ttft_ms = 250.0;        /* 0.25 s -> exactly the le="0.25" rung, index 2 */
+    t.decode_ms = 200.0;      /* 200 ms over 4 gaps -> exactly 50 ms, index 4  */
+    t.decode_tokens = 5;      /* 5 tokens is 4 gaps, NOT 5                     */
+    metrics_observe_request_timings(&t);
+
+    TEST_ASSERT(m->ttft_seconds.count == ttft0.count + 1);
+    TEST_ASSERT(m->ttft_seconds.bucket[2] == ttft0.bucket[2] + 1);
+    TEST_ASSERT(m->ttft_seconds.sum_ns == ttft0.sum_ns + 250000000ull);
+    TEST_ASSERT(m->itl_seconds.count == itl0.count + 1);
+    TEST_ASSERT(m->itl_seconds.bucket[4] == itl0.bucket[4] + 1);
+    TEST_ASSERT(m->itl_seconds.sum_ns == itl0.sum_ns + 50000000ull);
+
+    /* A single-token completion has no gap: TTFT observed, ITL untouched.  Both
+     * halves are asserted -- checking only the ITL side would stay green if a
+     * refactor returned early for decode_tokens <= 1 and dropped the TTFT. */
+    const ds4_metrics_hist itl1  = m->itl_seconds;
+    const ds4_metrics_hist ttftA = m->ttft_seconds;
+    req_timings one = {0};
+    one.valid = true;
+    one.ttft_ms = 250.0;
+    one.decode_ms = 200.0;
+    one.decode_tokens = 1;
+    metrics_observe_request_timings(&one);
+    TEST_ASSERT(m->itl_seconds.count == itl1.count);
+    TEST_ASSERT(m->ttft_seconds.count == ttftA.count + 1);
+
+    /* Assert through the RENDER too, so the observer test pins what /metrics
+     * actually says and not just the struct behind it.  Note this cannot pin
+     * the choice to DERIVE _count from the bucket walk: single-threaded, the
+     * walk and h->count are always equal, so either source passes here. */
+    {
+        buf rb = {0};
+        metrics_emit_histogram(&rb, "ds4_obs_ttft", &m->ttft_seconds, hist_le_ttft_ns);
+        char *rendered = buf_take(&rb);
+        char line[128];
+        snprintf(line, sizeof(line), "ds4_obs_ttft_count %llu\n",
+                 (unsigned long long)m->ttft_seconds.count);
+        TEST_ASSERT(strstr(rendered, line) != NULL);
+        snprintf(line, sizeof(line), "ds4_obs_ttft_bucket{le=\"+Inf\"} %llu\n",
+                 (unsigned long long)m->ttft_seconds.count);
+        TEST_ASSERT(strstr(rendered, line) != NULL);
+        free(rendered);
+    }
+
+    /* An unstamped block is not an observation of zero. */
+    const ds4_metrics_hist ttft1 = m->ttft_seconds;
+    req_timings invalid = {0};
+    invalid.ttft_ms = 250.0;
+    metrics_observe_request_timings(&invalid);   /* valid == false */
+    TEST_ASSERT(m->ttft_seconds.count == ttft1.count);
+}
+
+/* The serial lane's whole-request-vs-per-pass stamp split.  This is the seam
+ * that regressed once: resetting the TTFT endpoint at the decode_again label
+ * moved TTFT to the RETRY's first token, which is silent (a plausible number,
+ * several rungs high, on a counter with no reset path).  generate_job cannot be
+ * driven from a unit test, so the arithmetic lives in serial_timings_fill and
+ * is pinned here instead. */
+static void test_serial_timings_split_request_and_pass(void) {
+    req_timings t = {0};
+    /* Two passes: prefill 0.7->1.0, first token 1.0, tool recovery, retry's
+     * first token 5.0, retry ends 5.2.  40 tokens then 5. */
+    serial_timing_stamps st = {
+        .t_arrive = 0.7, .t_prefill_beg = 0.7, .t_prefill_end = 1.0,
+        .t_first_tok = 1.0, .t_pass_first_tok = 5.0, .t_decode_end = 5.2,
+        .request_tokens = 45, .pass_tokens = 5, .decode_steps = 4,
+        .prompt_tokens = 100, .cached = 40,
+    };
+    TEST_ASSERT(serial_timings_fill(&t, &st));
+    TEST_ASSERT(t.valid);
+    /* TTFT is arrival -> FIRST pass's first token: 300ms, not 4300ms. */
+    TEST_ASSERT(t.ttft_ms > 299.9 && t.ttft_ms < 300.1);
+    /* prefill is the request's own prefill, not the retry's. */
+    TEST_ASSERT(t.prefill_ms > 299.9 && t.prefill_ms < 300.1);
+    /* decode spans only the pass whose tokens decode_tokens reports. */
+    TEST_ASSERT(t.decode_ms > 199.9 && t.decode_ms < 200.1);
+    TEST_ASSERT(t.decode_tokens == 5);
+    TEST_ASSERT(t.prefill_tokens == 60 && t.prefill_cached == 40);
+
+    /* A pass that delivered no tokens must not turn the absolute monotonic
+     * clock into a decode duration. */
+    req_timings z = {0};
+    serial_timing_stamps zs = st;
+    zs.pass_tokens = 0;
+    zs.t_pass_first_tok = 0.0;
+    zs.t_decode_end = 54592.6;          /* a real uptime reading */
+    TEST_ASSERT(serial_timings_fill(&z, &zs));
+    TEST_ASSERT(z.decode_ms == 0.0);
+    /* ...and the request still reports its TTFT, because the client did see
+     * tokens on the first pass. */
+    TEST_ASSERT(z.ttft_ms > 299.9 && z.ttft_ms < 300.1);
+
+    /* A request that delivered nothing at all does not stamp. */
+    req_timings n = {0};
+    serial_timing_stamps ns = st;
+    ns.request_tokens = 0;
+    TEST_ASSERT(!serial_timings_fill(&n, &ns));
+    TEST_ASSERT(!n.valid);
+
+    /* No arrival stamp -> ttft omitted rather than fabricated, and
+     * metrics_observe_request_timings drops it (ttft_ms > 0.0 guard). */
+    req_timings a = {0};
+    serial_timing_stamps as = st;
+    as.t_arrive = 0.0;
+    TEST_ASSERT(serial_timings_fill(&a, &as));
+    TEST_ASSERT(a.ttft_ms == 0.0);
 }
 
 static void test_timings_block_renders_next_to_usage(void) {
@@ -29269,6 +29680,9 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_usage_reports_cache_details();
+    test_metrics_histogram_render();
+    test_metrics_observe_request_timings();
+    test_serial_timings_split_request_and_pass();
     test_timings_block_renders_next_to_usage();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
