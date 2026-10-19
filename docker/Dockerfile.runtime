@@ -1,0 +1,10 @@
+# k3s runtime for the qualified host build (spark-stack plan §3.7): no in-image build. The pod mounts this repo by
+# hostPath and runs ./ds4-server from it; the image adds the exact CUDA libraries that binary resolves on the host.
+#   docker build -f docker/Dockerfile.runtime --build-context cudalib=/usr/local/cuda-13.0/targets/sbsa-linux/lib -t spark-ds4-runtime:local docker
+FROM nvidia/cuda:13.0.2-runtime-ubuntu24.04@sha256:6a0e31b59e70890446f2c17356d6efc0d54260090a8c63d6ca7c2ad049db95d2
+COPY --from=cudalib libcudart.so.13.0.96 libcublas.so.13.1.1.3 libcublasLt.so.13.1.1.3 /opt/ds4/lib/
+RUN cd /opt/ds4/lib && ln -s libcudart.so.13.0.96 libcudart.so.13 && ln -s libcublas.so.13.1.1.3 libcublas.so.13 \
+    && ln -s libcublasLt.so.13.1.1.3 libcublasLt.so.13 && echo /opt/ds4/lib > /etc/ld.so.conf.d/00-ds4.conf && ldconfig
+LABEL org.trosfy.libcudart.sha256-prefix=7bdba2b5b08cbdc8 org.trosfy.libcublas.sha256-prefix=4e346a7b60a01552 \
+      org.trosfy.libcublasLt.sha256-prefix=930418840b747413
+ENV HOME=/root LD_LIBRARY_PATH=/opt/ds4/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
